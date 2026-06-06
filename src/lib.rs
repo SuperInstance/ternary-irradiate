@@ -1,464 +1,277 @@
-//! Radiation and energy propagation on ternary grids {-1, 0, +1}.
-//!
-//! Provides point sources, inverse-square irradiance, diffusion,
-//! shadow casting, half-life decay, cascade events, and shielding.
+//! Ternary irradiation: radiation damage, cascade simulation, annealing, defect tracking.
 
-#![forbid(unsafe_code)]
-#![no_std]
+use std::collections::HashMap;
 
-extern crate alloc;
-
-use alloc::vec::Vec;
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-fn idx(x: usize, y: usize, w: usize) -> usize {
-    y * w + x
-}
-
-fn in_bounds(x: i32, y: i32, w: usize, h: usize) -> bool {
-    x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h
-}
-
-fn snap(v: f64, lo: f64, hi: f64) -> i8 {
-    if v < lo { -1 }
-    else if v > hi { 1 }
-    else { 0 }
-}
-
-fn neighbors4(x: usize, y: usize, w: usize, h: usize) -> Vec<(usize, usize)> {
-    let mut ns = Vec::new();
-    for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-        let nx = x as i32 + dx;
-        let ny = y as i32 + dy;
-        if in_bounds(nx, ny, w, h) {
-            ns.push((nx as usize, ny as usize));
-        }
-    }
-    ns
-}
-
-// ── RadiationSource ──────────────────────────────────────────────────
-
-/// A point radiation source with intensity and decay rate.
+/// Ternary lattice for radiation simulation
 #[derive(Clone, Debug)]
-pub struct RadiationSource {
-    pub x: usize,
-    pub y: usize,
-    pub intensity: f64,
-    pub decay_rate: f64,
+pub struct TernaryLattice {
+    size: usize,
+    /// -1 = damaged, 0 = vacant, +1 = intact
+    cells: Vec<i8>,
+    defect_log: Vec<DefectEvent>,
 }
 
-impl RadiationSource {
-    pub fn new(x: usize, y: usize, intensity: f64, decay_rate: f64) -> Self {
-        Self { x, y, intensity, decay_rate }
+#[derive(Clone, Debug)]
+pub struct DefectEvent {
+    pub tick: usize,
+    pub position: usize,
+    pub old_state: i8,
+    pub new_state: i8,
+    pub cause: DefectCause,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DefectCause {
+    PrimaryKnock,    // Direct radiation hit
+    Cascade,         // Secondary cascade
+    ThermalRecovery, // Annealing
+    Recombination,   // Defect-vacancy recombination
+    Spontaneous,     // Spontaneous recovery
+}
+
+impl TernaryLattice {
+    pub fn new(size: usize) -> Self {
+        Self { size, cells: vec![1; size], defect_log: Vec::new() }
     }
 
-    /// Compute irradiance at (px, py) using inverse-square law with decay.
-    pub fn irradiance_at(&self, px: usize, py: usize) -> f64 {
-        let dx = px as f64 - self.x as f64;
-        let dy = py as f64 - self.y as f64;
-        let dist_sq = dx * dx + dy * dy;
-        if dist_sq < 1.0 {
-            self.intensity
-        } else {
-            self.intensity / (1.0 + self.decay_rate * dist_sq)
+    pub fn with_defects(size: usize, intact_ratio: f64, rng_vals: &[f64]) -> Self {
+        let mut cells = vec![1i8; size];
+        let defect_count = (size as f64 * (1.0 - intact_ratio)) as usize;
+        for i in 0..defect_count.min(rng_vals.len()) {
+            let idx = (rng_vals[i] * size as f64) as usize % size;
+            cells[idx] = -1;
         }
+        Self { size, cells, defect_log: Vec::new() }
     }
-}
 
-// ── IrradianceField ──────────────────────────────────────────────────
+    pub fn get(&self, idx: usize) -> i8 { self.cells[idx] }
+    pub fn set(&mut self, idx: usize, v: i8) { self.cells[idx] = v; }
+    pub fn len(&self) -> usize { self.size }
 
-/// Compute irradiance field from multiple sources on a grid.
-pub fn compute_irradiance(
-    sources: &[RadiationSource],
-    w: usize,
-    h: usize,
-) -> Vec<f64> {
-    let mut field = alloc::vec![0.0f64; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut total = 0.0;
-            for src in sources {
-                total += src.irradiance_at(x, y);
-            }
-            field[idx(x, y, w)] = total;
+    /// Simulate a radiation hit: primary knock-on + cascade
+    pub fn irradiate(&mut self, hit_pos: usize, energy: f64, tick: usize, rng: &[f64]) -> usize {
+        let mut defects = 0;
+        // Primary knock
+        if self.cells[hit_pos] == 1 {
+            self.defect_log.push(DefectEvent { tick, position: hit_pos, old_state: 1, new_state: -1, cause: DefectCause::PrimaryKnock });
+            self.cells[hit_pos] = -1;
+            defects += 1;
         }
-    }
-    field
-}
 
-// ── TernaryIrradianceMap ─────────────────────────────────────────────
-
-/// Convert continuous irradiance field to ternary grid.
-pub fn to_ternary(field: &[f64], w: usize, h: usize, lo: f64, hi: f64) -> Vec<i8> {
-    field.iter().map(|&v| snap(v, lo, hi)).collect()
-}
-
-// ── Diffusion ────────────────────────────────────────────────────────
-
-/// Ternary diffusion: each cell averages its 4-neighbors, then snaps to {-1, 0, +1}.
-pub fn diffuse(grid: &[i8], w: usize, h: usize, steps: usize) -> Vec<i8> {
-    let mut current = grid.to_vec();
-    let mut next = current.clone();
-
-    for _ in 0..steps {
-        for y in 0..h {
-            for x in 0..w {
-                let ns = neighbors4(x, y, w, h);
-                let mut sum = current[idx(x, y, w)] as f64;
-                let mut count = 1.0;
-                for &(nx, ny) in &ns {
-                    sum += current[idx(nx, ny, w)] as f64;
-                    count += 1.0;
-                }
-                next[idx(x, y, w)] = snap(sum / count, -0.33, 0.33);
+        // Cascade: each unit of energy can create additional defects
+        let cascade_size = (energy * 3.0) as usize;
+        let mut rng_idx = 0;
+        for _ in 0..cascade_size {
+            if rng_idx + 1 >= rng.len() { break; }
+            // Random walk from hit position
+            let offset = (rng[rng_idx] * 10.0) as i32 - 5;
+            rng_idx += 1;
+            let target = ((hit_pos as i32 + offset).rem_euclid(self.size as i32)) as usize;
+            if self.cells[target] == 1 {
+                self.defect_log.push(DefectEvent { tick, position: target, old_state: 1, new_state: -1, cause: DefectCause::Cascade });
+                self.cells[target] = -1;
+                defects += 1;
             }
         }
-        core::mem::swap(&mut current, &mut next);
+        defects
     }
-    current
-}
 
-// ── Absorption ───────────────────────────────────────────────────────
-
-/// Beam attenuation through a ternary medium along a row.
-/// +1 cells absorb (reduce intensity), -1 cells amplify, 0 cells are neutral.
-pub fn absorption(grid: &[i8], w: usize, h: usize, row: usize, initial: f64, coeff: f64) -> Vec<f64> {
-    let mut intensity = initial;
-    let mut result = Vec::new();
-    if row >= h { return result; }
-    for x in 0..w {
-        let cell = grid[idx(x, row, w)];
-        let factor = match cell {
-            1 => (-coeff).exp(),   // absorb
-            -1 => coeff.exp(),     // amplify
-            _ => 1.0,              // neutral
-        };
-        intensity *= factor;
-        result.push(intensity);
-    }
-    result
-}
-
-// ── ShadowCast ───────────────────────────────────────────────────────
-
-/// Directional shadow casting. +1 cells cast shadows in direction (dx, dy).
-/// Shadow cells are marked -1, lit cells +1, shadow boundaries 0.
-pub fn shadow_cast(grid: &[i8], w: usize, h: usize, dx: i32, dy: i32) -> Vec<i8> {
-    let mut shadow = alloc::vec![1i8; w * h];
-
-    for y in 0..h {
-        for x in 0..w {
-            if grid[idx(x, y, w)] == 1 {
-                // Cast shadow in direction
-                let mut sx = x as i32 + dx;
-                let mut sy = y as i32 + dy;
-                while in_bounds(sx, sy, w, h) {
-                    let si = idx(sx as usize, sy as usize, w);
-                    if shadow[si] == 1 {
-                        shadow[si] = -1;
-                    }
-                    sx += dx;
-                    sy += dy;
+    /// Thermal annealing: damaged cells spontaneously recover with given probability
+    pub fn anneal(&mut self, temperature: f64, tick: usize, rng: &[f64]) -> usize {
+        let recovery_prob = (temperature / 10.0).min(0.95);
+        let mut recovered = 0;
+        for i in 0..self.size {
+            if self.cells[i] == -1 {
+                let r = rng[i % rng.len()];
+                if r < recovery_prob {
+                    self.defect_log.push(DefectEvent { tick, position: i, old_state: -1, new_state: 1, cause: DefectCause::ThermalRecovery });
+                    self.cells[i] = 1;
+                    recovered += 1;
                 }
             }
         }
+        recovered
     }
 
-    // Mark cells that are shadow boundaries (0: adjacent to both +1 and -1)
-    let mut result = shadow.clone();
-    for y in 0..h {
-        for x in 0..w {
-            if shadow[idx(x, y, w)] == -1 {
-                let ns = neighbors4(x, y, w, h);
-                for &(nx, ny) in &ns {
-                    if shadow[idx(nx, ny, w)] == 1 {
-                        result[idx(x, y, w)] = 0;
+    /// Recombination: damaged cell next to vacancy can fill it
+    pub fn recombine(&mut self, tick: usize) -> usize {
+        let mut recombined = 0;
+        let mut changes = Vec::new();
+        for i in 0..self.size {
+            if self.cells[i] == 0 {
+                // Check neighbors for damaged cells
+                for &neighbor in &[i.saturating_sub(1), (i+1).min(self.size-1)] {
+                    if neighbor < self.size && self.cells[neighbor] == -1 {
+                        changes.push((i, 1)); // vacancy filled
+                        changes.push((neighbor, 0)); // damaged becomes vacant (moved)
                         break;
                     }
                 }
             }
         }
-    }
-    result
-}
-
-// ── HalfLife ─────────────────────────────────────────────────────────
-
-/// Simulate radioactive decay: +1 → 0 → -1 with given probability per step.
-pub fn half_life(grid: &[i8], w: usize, h: usize, steps: usize, decay_prob: f64) -> Vec<i8> {
-    let mut current = grid.to_vec();
-    let mut next = current.clone();
-
-    for _ in 0..steps {
-        for y in 0..h {
-            for x in 0..w {
-                let i = idx(x, y, w);
-                next[i] = match current[i] {
-                    1 => if pseudo_random(x, y, steps) < decay_prob { 0 } else { 1 },
-                    0 => if pseudo_random(x + 100, y + 100, steps) < decay_prob { -1 } else { 0 },
-                    _ => current[i],
-                };
+        for (pos, new_state) in changes {
+            let old = self.cells[pos];
+            if old != new_state {
+                self.defect_log.push(DefectEvent { tick, position: pos, old_state: old, new_state, cause: DefectCause::Recombination });
+                self.cells[pos] = new_state;
+                recombined += 1;
             }
         }
-        core::mem::swap(&mut current, &mut next);
+        recombined
     }
-    current
+
+    /// Integrity: fraction of intact cells
+    pub fn integrity(&self) -> f64 {
+        self.cells.iter().filter(|&&v| v == 1).count() as f64 / self.size as f64
+    }
+
+    /// Defect density
+    pub fn defect_density(&self) -> f64 {
+        self.cells.iter().filter(|&&v| v == -1).count() as f64 / self.size as f64
+    }
+
+    /// Vacancy density
+    pub fn vacancy_density(&self) -> f64 {
+        self.cells.iter().filter(|&&v| v == 0).count() as f64 / self.size as f64
+    }
+
+    /// Statistics
+    pub fn stats(&self) -> LatticeStats {
+        let intact = self.cells.iter().filter(|&&v| v == 1).count();
+        let damaged = self.cells.iter().filter(|&&v| v == -1).count();
+        let vacant = self.cells.iter().filter(|&&v| v == 0).count();
+        LatticeStats { intact, damaged, vacant, total: self.size }
+    }
 }
 
-/// Simple deterministic pseudo-random for reproducible tests (not crypto).
-fn pseudo_random(x: usize, y: usize, seed: usize) -> f64 {
-    let v = ((x.wrapping_mul(2654435761)).wrapping_add(y.wrapping_mul(2246822519)).wrapping_add(seed.wrapping_mul(3266489917))) as u64;
-    ((v ^ (v >> 16)) & 0xFFFF) as f64 / 65535.0
+#[derive(Debug)]
+pub struct LatticeStats {
+    pub intact: usize,
+    pub damaged: usize,
+    pub vacant: usize,
+    pub total: usize,
 }
 
-// ── CascadeEvent ─────────────────────────────────────────────────────
+/// Full irradiation simulation
+pub struct IrradiationSim {
+    pub lattice: TernaryLattice,
+    pub tick: usize,
+    pub history: Vec<LatticeStats>,
+}
 
-/// A cascade: one cell flips, neighbors may flip with given probability.
-/// Returns the set of flipped cell indices and final grid.
-pub fn cascade(grid: &[i8], w: usize, h: usize, start_x: usize, start_y: usize, flip_prob: f64) -> (Vec<usize>, Vec<i8>) {
-    let mut current = grid.to_vec();
-    let mut flipped = Vec::new();
-    let mut frontier = alloc::vec![(start_x, start_y)];
+impl IrradiationSim {
+    pub fn new(lattice_size: usize) -> Self {
+        Self { lattice: TernaryLattice::new(lattice_size), tick: 0, history: Vec::new() }
+    }
 
-    // Flip the start cell
-    let si = idx(start_x, start_y, w);
-    current[si] = flip_val(current[si]);
-    flipped.push(si);
-
-    let mut step = 0usize;
-    while !frontier.is_empty() {
-        let mut next_frontier = Vec::new();
-        for &(fx, fy) in &frontier {
-            let ns = neighbors4(fx, fy, w, h);
-            for &(nx, ny) in &ns {
-                let ni = idx(nx, ny, w);
-                if !flipped.contains(&ni) && pseudo_random(nx, ny, step) < flip_prob {
-                    current[ni] = flip_val(current[ni]);
-                    flipped.push(ni);
-                    next_frontier.push((nx, ny));
-                }
-            }
+    /// Run one tick: irradiate + anneal + recombine
+    pub fn step(&mut self, dose_rate: f64, temperature: f64, rng: &[f64]) -> (usize, usize, usize) {
+        let n_hits = (dose_rate * self.lattice.size as f64) as usize;
+        let mut total_defects = 0;
+        let mut offset = 0;
+        for _ in 0..n_hits {
+            if offset + 10 >= rng.len() { break; }
+            let pos = (rng[offset] * self.lattice.size as f64) as usize;
+            let energy = rng[offset + 1] * 5.0 + 1.0;
+            offset += 2;
+            total_defects += self.lattice.irradiate(pos, energy, self.tick, &rng[offset..]);
+            offset += (energy * 3.0) as usize;
         }
-        frontier = next_frontier;
-        step += 1;
+        let recovered = self.lattice.anneal(temperature, self.tick, rng);
+        let recombined = self.lattice.recombine(self.tick);
+        self.history.push(self.lattice.stats());
+        self.tick += 1;
+        (total_defects, recovered, recombined)
     }
 
-    (flipped, current)
-}
-
-fn flip_val(v: i8) -> i8 {
-    match v {
-        1 => -1,
-        -1 => 1,
-        _ => 0,
-    }
-}
-
-// ── IrradianceProfile ────────────────────────────────────────────────
-
-/// 1D irradiance profile across a row or column.
-pub fn profile_row(field: &[f64], w: usize, h: usize, row: usize) -> Vec<f64> {
-    if row >= h { return Vec::new(); }
-    (0..w).map(|x| field[idx(x, row, w)]).collect()
-}
-
-pub fn profile_col(field: &[f64], w: usize, h: usize, col: usize) -> Vec<f64> {
-    if col >= w { return Vec::new(); }
-    (0..h).map(|y| field[idx(col, y, w)]).collect()
-}
-
-// ── Shielding ────────────────────────────────────────────────────────
-
-/// Compute how many 0 cells (shields) are between two points on the grid.
-/// Uses Bresenham-style line traversal.
-pub fn shielding(grid: &[i8], w: usize, h: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> usize {
-    let dx = (x1 as i64 - x0 as i64).abs();
-    let dy = (y1 as i64 - y0 as i64).abs();
-    let sx: i64 = if x0 < x1 { 1 } else { -1 };
-    let sy: i64 = if y0 < y1 { 1 } else { -1 };
-
-    let mut x = x0 as i64;
-    let mut y = y0 as i64;
-    let mut err = dx - dy;
-    let mut count = 0;
-
-    loop {
-        if (x as usize) < w && (y as usize) < h {
-            if grid[idx(x as usize, y as usize, w)] == 0 {
-                count += 1;
-            }
+    /// Run simulation for n ticks
+    pub fn run(&mut self, ticks: usize, dose_rate: f64, temperature: f64, rng: &[f64]) {
+        let mut rng_offset = 0;
+        for _ in 0..ticks {
+            let needed = (dose_rate * self.lattice.size as f64 * 15.0) as usize;
+            if rng_offset + needed >= rng.len() { break; }
+            self.step(dose_rate, temperature, &rng[rng_offset..]);
+            rng_offset += needed;
         }
-        if x == x1 as i64 && y == y1 as i64 { break; }
-        let e2 = 2 * err;
-        if e2 > -dy { err -= dy; x += sx; }
-        if e2 < dx { err += dx; y += sy; }
     }
-    count
 }
-
-/// Check if there is a clear line of sight (no 0 shields) between two points.
-pub fn has_line_of_sight(grid: &[i8], w: usize, h: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> bool {
-    shielding(grid, w, h, x0, y0, x1, y1) == 0
-}
-
-// ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn grid3x3(vals: &[i8]) -> (Vec<i8>, usize, usize) {
-        (vals.to_vec(), 3, 3)
+    fn make_rng(n: usize) -> Vec<f64> {
+        (0..n).map(|i| ((i as u64 * 6364136223846793005 + 1442695040888963407) as f64 / u64::MAX as f64)).collect()
     }
 
     #[test]
-    fn source_irradiance_at_center() {
-        let src = RadiationSource::new(1, 1, 10.0, 1.0);
-        let v = src.irradiance_at(1, 1);
-        assert_eq!(v, 10.0); // distance 0
+    fn test_fresh_lattice_full_integrity() {
+        let l = TernaryLattice::new(100);
+        assert!((l.integrity() - 1.0).abs() < 1e-10);
     }
 
     #[test]
-    fn source_irradiance_decay() {
-        let src = RadiationSource::new(0, 0, 10.0, 1.0);
-        let v0 = src.irradiance_at(0, 0);
-        let v1 = src.irradiance_at(1, 0);
-        let v2 = src.irradiance_at(2, 0);
-        assert!(v0 > v1);
-        assert!(v1 > v2);
+    fn test_irradiate_creates_defects() {
+        let mut l = TernaryLattice::new(100);
+        let rng = make_rng(200);
+        let defects = l.irradiate(50, 2.0, 0, &rng);
+        assert!(defects > 0);
+        assert!(l.integrity() < 1.0);
     }
 
     #[test]
-    fn compute_irradiance_basic() {
-        let sources = vec![RadiationSource::new(0, 0, 5.0, 0.0)];
-        let field = compute_irradiance(&sources, 3, 3);
-        assert!(field[idx(0, 0, 3)] > field[idx(2, 2, 3)]);
+    fn test_anneal_recovers() {
+        let mut l = TernaryLattice::new(100);
+        let rng = make_rng(200);
+        l.irradiate(50, 3.0, 0, &rng);
+        let damaged_before = l.defect_density();
+        l.anneal(5.0, 1, &rng);
+        let damaged_after = l.defect_density();
+        assert!(damaged_after <= damaged_before);
     }
 
     #[test]
-    fn to_ternary_thresholds() {
-        let field = vec![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let t = to_ternary(&field, 5, 1, -0.33, 0.33);
-        assert_eq!(t, vec![-1, -1, 0, 1, 1]);
+    fn test_recombination() {
+        let mut l = TernaryLattice::new(20);
+        l.set(5, -1); // damaged
+        l.set(6, 0);  // vacancy
+        let r = l.recombine(0);
+        assert!(r > 0);
     }
 
     #[test]
-    fn diffuse_uniform() {
-        let grid = vec![1, 1, 1, 1, 1, 1, 1, 1, 1];
-        let result = diffuse(&grid, 3, 3, 1);
-        assert!(result.iter().all(|&v| v == 1)); // uniform stays uniform
+    fn test_simulation_runs() {
+        let rng = make_rng(50000);
+        let mut sim = IrradiationSim::new(200);
+        sim.run(50, 0.01, 2.0, &rng);
+        assert_eq!(sim.tick, 50);
+        assert!(!sim.history.is_empty());
     }
 
     #[test]
-    fn diffuse_spreads() {
-        let mut grid = vec![0; 25];
-        grid[12] = 1; // center of 5x5
-        let result = diffuse(&grid, 5, 5, 5);
-        // After diffusion, neighbors should have some non-zero values
-        let non_zero = result.iter().filter(|&&v| v != 0).count();
-        assert!(non_zero > 1); // spread beyond center
+    fn test_equilibrium_dose_recovery() {
+        let rng = make_rng(100000);
+        let mut sim = IrradiationSim::new(500);
+        sim.run(200, 0.005, 8.0, &rng); // high temperature, low dose
+        // Should recover most defects
+        assert!(sim.lattice.integrity() > 0.5);
     }
 
     #[test]
-    fn absorption_row() {
-        let grid = vec![1, 0, -1, 0, 1];
-        let result = absorption(&grid, 5, 1, 0, 100.0, 0.5);
-        assert_eq!(result.len(), 5);
-        assert!(result[0] < 100.0); // +1 absorbs
-        assert_eq!(result[1], result[0]); // 0 neutral
-        assert!(result[2] > result[1]); // -1 amplifies
+    fn test_defect_log_tracks_events() {
+        let mut l = TernaryLattice::new(50);
+        let rng = make_rng(200);
+        l.irradiate(25, 1.0, 0, &rng);
+        assert!(!l.defect_log.is_empty());
+        assert_eq!(l.defect_log[0].cause, DefectCause::PrimaryKnock);
     }
 
     #[test]
-    fn shadow_cast_basic() {
-        // 3x3 with a wall at (1,1)
-        let grid = vec![0, 0, 0, 0, 1, 0, 0, 0, 0];
-        let shadow = shadow_cast(&grid, 3, 3, 1, 1); // direction: down-right
-        assert_eq!(shadow[idx(2, 2, 3)], -1); // shadow behind wall
-    }
-
-    #[test]
-    fn shadow_cast_origin_lit() {
-        let grid = vec![0, 0, 0, 0, 1, 0, 0, 0, 0];
-        let shadow = shadow_cast(&grid, 3, 3, 0, 1); // direction: down
-        assert_eq!(shadow[idx(1, 1, 3)], 1); // the wall itself is lit
-    }
-
-    #[test]
-    fn half_life_decay() {
-        let grid = vec![1; 25];
-        let result = half_life(&grid, 5, 5, 10, 1.0); // guaranteed decay
-        // With prob=1.0 all should decay
-        assert!(result.iter().any(|&v| v != 1));
-    }
-
-    #[test]
-    fn half_life_no_decay() {
-        let grid = vec![1, 0, -1, 1, 0];
-        let result = half_life(&grid, 5, 1, 5, 0.0); // prob=0, no decay
-        assert_eq!(result, grid);
-    }
-
-    #[test]
-    fn cascade_single_flip() {
-        let grid = vec![0; 25]; // all zeros, nothing to cascade to
-        let (flipped, _) = cascade(&grid, 5, 5, 2, 2, 0.0);
-        assert_eq!(flipped.len(), 1); // only the start cell
-    }
-
-    #[test]
-    fn cascade_propagation() {
-        let grid = vec![1; 25]; // all +1
-        let (flipped, result) = cascade(&grid, 5, 5, 2, 2, 1.0); // prob=1
-        assert!(flipped.len() > 1);
-        assert!(result.iter().any(|&v| v == -1)); // flipped to -1
-    }
-
-    #[test]
-    fn profile_row_basic() {
-        let field = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let p = profile_row(&field, 3, 2, 0);
-        assert_eq!(p, vec![1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn profile_col_basic() {
-        let field = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let p = profile_col(&field, 3, 2, 1);
-        assert_eq!(p, vec![2.0, 5.0]);
-    }
-
-    #[test]
-    fn shielding_line_of_sight() {
-        let grid = vec![1, 0, 1, 0, 0, 0, 1, 0, 1]; // 3x3
-        let s = shielding(&grid, 3, 3, 0, 0, 2, 2);
-        assert!(s > 0); // has shields in between
-    }
-
-    #[test]
-    fn has_los_clear() {
-        let grid = vec![1, 1, 1, 1, 1, 1, 1, 1, 1];
-        assert!(has_line_of_sight(&grid, 3, 3, 0, 0, 2, 2));
-    }
-
-    #[test]
-    fn has_los_blocked() {
-        let mut grid = vec![1; 9];
-        grid[idx(1, 1, 3)] = 0; // shield in center
-        assert!(!has_line_of_sight(&grid, 3, 3, 0, 0, 2, 2));
-    }
-
-    #[test]
-    fn multiple_sources_additive() {
-        let sources = vec![
-            RadiationSource::new(0, 0, 5.0, 0.5),
-            RadiationSource::new(4, 4, 5.0, 0.5),
-        ];
-        let field = compute_irradiance(&sources, 5, 5);
-        // Center should have contributions from both
-        let center = field[idx(2, 2, 5)];
-        assert!(center > 0.0);
+    fn test_stats_consistency() {
+        let mut l = TernaryLattice::new(100);
+        let rng = make_rng(200);
+        l.irradiate(50, 2.0, 0, &rng);
+        let s = l.stats();
+        assert_eq!(s.intact + s.damaged + s.vacant, s.total);
     }
 }
