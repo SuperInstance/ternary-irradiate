@@ -1,4 +1,6 @@
 [package]
+description = "ternary-irradiate - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/ternary-irradiate"
 name = "ternary-irradiate"
 version = "0.1.0"
 edition = "2021"
